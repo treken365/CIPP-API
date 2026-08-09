@@ -6,8 +6,9 @@ function New-CIPPSSOApp {
         Creates a new or updates an existing Entra ID app registration for CIPP-SSO with
         openid, profile, and email delegated permissions. If ExistingAppId is provided,
         looks up that specific app by clientId. If the app no longer exists in the tenant,
-        creates a new one. Generates a client secret and returns the details needed to
-        configure EasyAuth.
+        creates a new one. Does NOT create a client secret — call Add-CIPPSSOAppSecret
+        for that as a separate step so the AppId can be persisted before the (sometimes
+        flaky) secret creation runs.
     #>
     [CmdletBinding()]
     param(
@@ -24,6 +25,16 @@ function New-CIPPSSOApp {
     $AppDisplayName = 'CIPP-SSO'
     $CallbackUri = $RedirectUri.TrimEnd('/') + '/.auth/login/aad/callback'
     $SignInAudience = if ($MultiTenant) { 'AzureADMultipleOrgs' } else { 'AzureADMyOrg' }
+
+    # A container can carry several custom domains and EasyAuth derives redirect_uri from the
+    # incoming Host header, so every bound hostname needs its own callback - not just the URL
+    # the admin happened to run setup from. Writing only $CallbackUri here would strip sign-in
+    # from every other domain until the next warmup re-added it.
+    $DesiredUris = [System.Collections.Generic.List[string]]::new()
+    $DesiredUris.Add($CallbackUri)
+    foreach ($Uri in @(Get-CIPPSiteHostname -AsRedirectUri)) {
+        if ($Uri -notin $DesiredUris) { $DesiredUris.Add($Uri) }
+    }
 
     # Microsoft Graph resource ID and delegated permission GUIDs
     $GraphResourceId = '00000003-0000-0000-c000-000000000000'
@@ -55,9 +66,17 @@ function New-CIPPSSOApp {
         $State = 'updated'
         Write-Information "[SSO-App] Updating existing app: $AppClientId"
 
+        # Union with what is already registered - never send a shorter array than the app
+        # already has, or re-running setup silently breaks sign-in on the other domains.
+        $MergedUris = [System.Collections.Generic.List[string]]::new()
+        foreach ($Uri in @($ExistingApp.web.redirectUris)) { $MergedUris.Add($Uri) }
+        foreach ($Uri in $DesiredUris) {
+            if ($Uri -notin $MergedUris) { $MergedUris.Add($Uri) }
+        }
+
         $PatchBody = @{
             web                    = @{
-                redirectUris          = @($CallbackUri)
+                redirectUris          = $MergedUris
                 implicitGrantSettings = @{ enableIdTokenIssuance = $true }
             }
             signInAudience         = $SignInAudience
@@ -69,7 +88,7 @@ function New-CIPPSSOApp {
             )
         } | ConvertTo-Json -Depth 10 -Compress
 
-        New-GraphPOSTRequest -uri "https://graph.microsoft.com/v1.0/applications/$AppObjectId" -body $PatchBody -type PATCH -NoAuthCheck $true -AsApp $true
+        $null = New-GraphPOSTRequest -uri "https://graph.microsoft.com/v1.0/applications/$AppObjectId" -body $PatchBody -type PATCH -NoAuthCheck $true -AsApp $true
     } else {
         # Create new app registration
         $State = 'created'
@@ -79,7 +98,7 @@ function New-CIPPSSOApp {
             displayName            = $AppDisplayName
             signInAudience         = $SignInAudience
             web                    = @{
-                redirectUris          = @($CallbackUri)
+                redirectUris          = $DesiredUris
                 implicitGrantSettings = @{ enableIdTokenIssuance = $true }
             }
             requiredResourceAccess = @(
@@ -120,37 +139,12 @@ function New-CIPPSSOApp {
         Write-Warning "[SSO-App] App management policy update failed (secret creation may still work): $($_.Exception.Message)"
     }
 
-    # Create client secret with retry
-    $SecretText = $null
-    $SecretAttempt = 0
-    $MaxSecretRetries = 5
-    while ($SecretAttempt -lt $MaxSecretRetries -and -not $SecretText) {
-        try {
-            $PasswordBody = '{"passwordCredential":{"displayName":"CIPP-SSO-Secret"}}'
-            $PasswordResult = New-GraphPOSTRequest -uri "https://graph.microsoft.com/v1.0/applications/$AppObjectId/addPassword" -body $PasswordBody -type POST -NoAuthCheck $true -AsApp $true
-            $SecretText = $PasswordResult.secretText
-            Write-Information "[SSO-App] Client secret created"
-        } catch {
-            $SecretAttempt++
-            Write-Warning "[SSO-App] Secret creation attempt $SecretAttempt/$MaxSecretRetries failed: $($_.Exception.Message)"
-            if ($SecretAttempt -lt $MaxSecretRetries) {
-                $Delay = @(2, 5, 10, 15, 30)[$SecretAttempt - 1]
-                Start-Sleep -Seconds $Delay
-            }
-        }
-    }
-
-    if (-not $SecretText) {
-        throw "Failed to create client secret for $AppDisplayName after $MaxSecretRetries attempts"
-    }
-
     return [PSCustomObject]@{
-        AppId        = $AppClientId
-        ObjectId     = $AppObjectId
-        ClientSecret = $SecretText
-        TenantId     = $env:TenantID
-        DisplayName  = $AppDisplayName
-        State        = $State
-        MultiTenant  = $MultiTenant
+        AppId       = $AppClientId
+        ObjectId    = $AppObjectId
+        TenantId    = $env:TenantID
+        DisplayName = $AppDisplayName
+        State       = $State
+        MultiTenant = $MultiTenant
     }
 }
